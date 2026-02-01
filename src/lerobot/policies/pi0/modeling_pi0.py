@@ -19,6 +19,7 @@ import logging
 import math
 from collections import deque
 from pathlib import Path
+from contextlib import ContextDecorator
 from typing import TYPE_CHECKING, Literal, TypedDict
 
 import torch
@@ -57,6 +58,23 @@ class ActionSelectKwargs(TypedDict, total=False):
     inference_delay: int | None
     prev_chunk_left_over: Tensor | None
     execution_horizon: int | None
+
+
+class CudaTimer(ContextDecorator):
+    def __init__(self, name=""):
+        self.name = name
+        self.start_event = torch.cuda.Event(enable_timing=True)
+        self.end_event = torch.cuda.Event(enable_timing=True)
+
+    def __enter__(self):
+        self.start_event.record()
+        return self
+
+    def __exit__(self, *exc):
+        self.end_event.record()
+        torch.cuda.synchronize()
+        self.elapsed_ms = self.start_event.elapsed_time(self.end_event)
+        print(f"[{self.name}] {self.elapsed_ms:.3f} ms")
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -616,7 +634,7 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
     def _prepare_attention_masks_4d(self, att_2d_masks):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, OPENPI_ATTENTION_MASK_VALUE)
+        return torch.where(att_2d_masks_4d.to(torch.bool), 0.0, OPENPI_ATTENTION_MASK_VALUE)
 
     def sample_noise(self, shape, device):
         return torch.normal(
@@ -827,22 +845,24 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             )  # Use config max_action_dim for internal processing
             noise = self.sample_noise(actions_shape, device)
 
-        prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
-            images, img_masks, lang_tokens, lang_masks
-        )
-        prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
-        prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+        with CudaTimer("embed_prefix"):
+            prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(
+                images, img_masks, lang_tokens, lang_masks
+            )
+            prefix_att_2d_masks = make_att_2d_masks(prefix_pad_masks, prefix_att_masks)
+            prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
 
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
         self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        with CudaTimer("prefix_forward"):
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
 
         dt = -1.0 / num_steps
 
@@ -860,21 +880,22 @@ class PI0Pytorch(nn.Module):  # see openpi `PI0Pytorch`
                     timestep=current_timestep,
                 )
 
-            if self._rtc_enabled():
-                inference_delay = kwargs.get("inference_delay")
-                prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
-                execution_horizon = kwargs.get("execution_horizon")
+            with CudaTimer(f"denoise_step_{step}"):
+                if self._rtc_enabled():
+                    inference_delay = kwargs.get("inference_delay")
+                    prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
+                    execution_horizon = kwargs.get("execution_horizon")
 
-                v_t = self.rtc_processor.denoise_step(
-                    x_t=x_t,
-                    prev_chunk_left_over=prev_chunk_left_over,
-                    inference_delay=inference_delay,
-                    time=time,
-                    original_denoise_step_partial=denoise_step_partial_call,
-                    execution_horizon=execution_horizon,
-                )
-            else:
-                v_t = denoise_step_partial_call(x_t)
+                    v_t = self.rtc_processor.denoise_step(
+                        x_t=x_t,
+                        prev_chunk_left_over=prev_chunk_left_over,
+                        inference_delay=inference_delay,
+                        time=time,
+                        original_denoise_step_partial=denoise_step_partial_call,
+                        execution_horizon=execution_horizon,
+                    )
+                else:
+                    v_t = denoise_step_partial_call(x_t)
 
             x_t = x_t + dt * v_t
 
@@ -1156,15 +1177,16 @@ class PI0Policy(PreTrainedPolicy):
         Images from LeRobot are typically in [B, C, H, W] format and normalized to [0, 1].
         PaliGemma expects images in [B, C, H, W] format and normalized to [-1, 1].
         """
-        images = []
-        img_masks = []
+        with CudaTimer("preprocess_images"):
+            images = []
+            img_masks = []
 
-        # Get device from model parameters
-        device = next(self.parameters()).device
+            # Get device from model parameters
+            device = next(self.parameters()).device
 
         present_img_keys = [key for key in self.config.image_features if key in batch]
         missing_img_keys = [key for key in self.config.image_features if key not in batch]
-
+        print("(´・ω・`)")
         if len(present_img_keys) == 0:
             raise ValueError(
                 f"All image features are missing from the batch. At least one expected. "
@@ -1218,12 +1240,12 @@ class PI0Policy(PreTrainedPolicy):
     def prepare_state(self, batch):
         """Pad state"""
         state = pad_vector(batch[OBS_STATE], self.config.max_state_dim)
-        return state
+        return state.to(next(self.parameters()).device)
 
     def prepare_action(self, batch):
         """Pad action"""
         actions = pad_vector(batch[ACTION], self.config.max_action_dim)
-        return actions
+        return actions.to(next(self.parameters()).device)
 
     @torch.no_grad()
     def select_action(self, batch: dict[str, Tensor]) -> Tensor:
@@ -1247,17 +1269,20 @@ class PI0Policy(PreTrainedPolicy):
         """Predict a chunk of actions given environment observations."""
         self.eval()
 
-        # Prepare inputs
-        images, img_masks = self._preprocess_images(batch)
-        lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
-        state = self.prepare_state(batch)
+        with CudaTimer("predict_action_chunk"):
+            # Prepare inputs
+            images, img_masks = self._preprocess_images(batch)
+            device = next(self.parameters()).device
+            lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"].to(device)
+            lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"].to(device)
+            state = self.prepare_state(batch)
 
-        # Sample actions using the model (pass through RTC kwargs)
-        actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state, **kwargs)
+            # Sample actions using the model (pass through RTC kwargs)
+            actions = self.model.sample_actions(images, img_masks, lang_tokens, lang_masks, state, **kwargs)
 
-        # Unpad actions to actual action dimension
-        original_action_dim = self.config.output_features[ACTION].shape[0]
-        actions = actions[:, :, :original_action_dim]
+            # Unpad actions to actual action dimension
+            original_action_dim = self.config.output_features[ACTION].shape[0]
+            actions = actions[:, :, :original_action_dim]
 
         return actions
 
@@ -1272,7 +1297,9 @@ class PI0Policy(PreTrainedPolicy):
         """
         # Prepare inputs
         images, img_masks = self._preprocess_images(batch)
-        lang_tokens, lang_masks = batch[f"{OBS_LANGUAGE_TOKENS}"], batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+        device = next(self.parameters()).device
+        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"].to(device)
+        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"].to(device)
         state = self.prepare_state(batch)
         actions = self.prepare_action(batch)
 
