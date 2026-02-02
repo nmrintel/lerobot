@@ -65,6 +65,8 @@ class CudaTimer(ContextDecorator):
         self.name = name
         self.start_event = torch.cuda.Event(enable_timing=True)
         self.end_event = torch.cuda.Event(enable_timing=True)
+        if self.name not in self.STATS:
+            self.STATS[self.name] = []
 
     def __enter__(self):
         self.start_event.record()
@@ -74,7 +76,15 @@ class CudaTimer(ContextDecorator):
         self.end_event.record()
         torch.cuda.synchronize()
         self.elapsed_ms = self.start_event.elapsed_time(self.end_event)
-        print(f"[{self.name}] {self.elapsed_ms:.3f} ms")
+        self.STATS[self.name].append(self.elapsed_ms)
+        # print(f"[{self.name}] {self.elapsed_ms:.3f} ms")
+
+    STATS = {}
+
+    @classmethod
+    def clear_stats(cls):
+        cls.STATS = {}
+
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -1184,56 +1194,56 @@ class PI0Policy(PreTrainedPolicy):
             # Get device from model parameters
             device = next(self.parameters()).device
 
-        present_img_keys = [key for key in self.config.image_features if key in batch]
-        missing_img_keys = [key for key in self.config.image_features if key not in batch]
-        print("(´・ω・`)")
-        if len(present_img_keys) == 0:
-            raise ValueError(
-                f"All image features are missing from the batch. At least one expected. "
-                f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
-            )
+            present_img_keys = [key for key in self.config.image_features if key in batch]
+            missing_img_keys = [key for key in self.config.image_features if key not in batch]
+            # print("(´・ω・`)")
+            if len(present_img_keys) == 0:
+                raise ValueError(
+                    f"All image features are missing from the batch. At least one expected. "
+                    f"(batch: {batch.keys()}) (image_features: {self.config.image_features})"
+                )
 
-        for key in present_img_keys:
-            img = batch[key]
+            for key in present_img_keys:
+                img = batch[key]
 
-            # Ensure tensor is on the same device as the model
-            if img.device != device:
-                img = img.to(device)
+                # Ensure tensor is on the same device as the model
+                if img.device != device:
+                    img = img.to(device)
 
-            # Ensure float32 dtype for consistency
-            if img.dtype != torch.float32:
-                img = img.to(torch.float32)
+                # Ensure float32 dtype for consistency
+                if img.dtype != torch.float32:
+                    img = img.to(torch.float32)
 
-            # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
-            is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
+                # from openpi preprocess_observation_pytorch: Handle both [B, C, H, W] and [B, H, W, C] formats
+                is_channels_first = img.shape[1] == 3  # Check if channels are in dimension 1
 
-            if is_channels_first:
-                # Convert [B, C, H, W] to [B, H, W, C] for processing
-                img = img.permute(0, 2, 3, 1)
+                if is_channels_first:
+                    # Convert [B, C, H, W] to [B, H, W, C] for processing
+                    img = img.permute(0, 2, 3, 1)
 
-            # from openpi preprocess_observation_pytorch: Resize with padding if needed
-            if img.shape[1:3] != self.config.image_resolution:
-                img = resize_with_pad_torch(img, *self.config.image_resolution)
+                # from openpi preprocess_observation_pytorch: Resize with padding if needed
+                if img.shape[1:3] != self.config.image_resolution:
+                    img = resize_with_pad_torch(img, *self.config.image_resolution)
 
-            # Normalize from [0,1] to [-1,1] as expected by siglip
-            img = img * 2.0 - 1.0
+                # Normalize from [0,1] to [-1,1] as expected by siglip
+                img = img * 2.0 - 1.0
 
-            # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
-            if is_channels_first:
-                img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
+                # from openpi preprocess_observation_pytorch: Convert back to [B, C, H, W] format if it was originally channels-first
+                if is_channels_first:
+                    img = img.permute(0, 3, 1, 2)  # [B, H, W, C] -> [B, C, H, W]
 
-            images.append(img)
-            # Create mask (all ones for real images)
-            bsize = img.shape[0]
-            mask = torch.ones(bsize, dtype=torch.bool, device=device)
-            img_masks.append(mask)
+                images.append(img)
+                # Create mask (all ones for real images)
+                bsize = img.shape[0]
+                mask = torch.ones(bsize, dtype=torch.bool, device=device)
+                img_masks.append(mask)
 
-        # Create image features not present in the batch as fully 0 padded images
-        for _num_empty_cameras in range(len(missing_img_keys)):
-            img = torch.ones_like(img) * -1  # padded with -1 for SigLIP
-            mask = torch.zeros_like(mask)  # mask is zero for empty cameras
-            images.append(img)
-            img_masks.append(mask)
+            # Create image features not present in the batch as fully 0 padded images
+            for _num_empty_cameras in range(len(missing_img_keys)):
+                img = torch.ones_like(img) * -1  # padded with -1 for SigLIP
+                mask = torch.zeros_like(mask)  # mask is zero for empty cameras
+                images.append(img)
+                img_masks.append(mask)
 
         return images, img_masks
 
